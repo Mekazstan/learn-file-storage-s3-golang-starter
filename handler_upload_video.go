@@ -101,14 +101,27 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// Reset file pointer to beginning for S3 upload
-	_, err = tempFile.Seek(0, io.SeekStart)
+	// Close the temp file so ffmpeg can access it
+	tempFile.Close()
+
+	// Step 7b: Process video for fast start in-order to enable video streaming before uploading to S3
+	fmt.Println("Processing video for fast start...")
+	processedPath, err := processVideoForFastStart(tempFile.Name())
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Failed to reset file pointer", err)
+		respondWithError(w, http.StatusInternalServerError, "Failed to process video for fast start", err)
 		return
 	}
+	defer os.Remove(processedPath) // Clean up processed file
 
-	// Generate random filename (similar to thumbnail upload)
+	// Open the processed file for S3 upload
+	processedFile, err := os.Open(processedPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to open processed video", err)
+		return
+	}
+	defer processedFile.Close()
+
+	// Generate random filename
 	randomBytes := make([]byte, 32)
 	_, err = rand.Read(randomBytes)
 	if err != nil {
@@ -117,7 +130,18 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	randomString := base64.RawURLEncoding.EncodeToString(randomBytes)
-	fileKey := randomString + ".mp4"
+
+	// Detect video aspect ratio
+	aspectRatio, err := getVideoAspectRatio(processedPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to analyze video", err)
+		return
+	}
+
+	fmt.Printf("Detected video aspect ratio: %s\n", aspectRatio)
+
+	// Create S3 key with aspect ratio prefix
+	fileKey := fmt.Sprintf("%s/%s.mp4", aspectRatio, randomString)
 
 	// Step 8: Upload to S3 with retry logic
 	maxRetries := 3
@@ -125,7 +149,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	for attempt := 1; attempt <= maxRetries; attempt++ {
 		// Reset file pointer to beginning for each retry
-		_, seekErr := tempFile.Seek(0, io.SeekStart)
+		_, seekErr := processedFile.Seek(0, io.SeekStart)
 		if seekErr != nil {
 			uploadErr = seekErr
 			break
@@ -134,7 +158,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		_, uploadErr = cfg.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 			Bucket:      aws.String(cfg.s3Bucket),
 			Key:         aws.String(fileKey),
-			Body:        tempFile,
+			Body:        processedFile,
 			ContentType: aws.String("video/mp4"),
 		})
 
@@ -158,7 +182,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Step 9: Update DB with S3 URL
-	videoURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, fileKey)
+	videoURL := fmt.Sprintf("%s,%s", cfg.s3Bucket, fileKey)
 
 	// Update the video with the S3 URL
 	updatedVideo := video // Copy existing video
@@ -172,5 +196,12 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, updatedVideo)
+	// Convert to signed video for response
+	signedVideo, err := cfg.dbVideoToSignedVideo(updatedVideo)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to generate signed URL", err)
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, signedVideo)
 }
